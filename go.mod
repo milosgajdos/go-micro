@@ -14,6 +14,7 @@ require (
 	github.com/coreos/go-semver v0.3.0 // indirect
 	github.com/coreos/go-systemd v0.0.0-20190719114852-fd7a80b32e1f // indirect
 	github.com/coreos/pkg v0.0.0-20180928190104-399ea9e2e55f // indirect
+	github.com/flynn/noise v0.0.0-20180327030543-2492fe189ae6
 	github.com/forestgiant/sliceutil v0.0.0-20160425183142-94783f95db6c
 	github.com/fsnotify/fsnotify v1.4.7
 	github.com/fsouza/go-dockerclient v1.4.4

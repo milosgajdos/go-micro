@@ -163,7 +163,7 @@ func (s *session) Accept() error {
 	}
 
 	// don't wait on multicast/broadcast
-	if s.mode == Multicast {
+	if s.mode == Multicast || s.mode == Broadcast {
 		return nil
 	}
 
