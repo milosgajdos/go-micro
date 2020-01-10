@@ -103,8 +103,10 @@ message Peer {
 
 // Sync is network sync message
 message Sync {
+        // ack flag
+        bool ack = 1;
         // peer origin
-        Peer peer = 1;
+        Peer peer = 2;
         // node routes
-        repeated go.micro.router.Route routes = 2;
+        repeated go.micro.router.Route routes = 3;
 }

@@ -354,12 +354,13 @@ func (n *network) advertise(advertChan <-chan *router.Advert) {
 				// get a list of node peers
 				peers := n.Peers()
 				// pick a random peer from the list of peers
-				peer := n.node.GetPeerNode(peers[rnd.Intn(len(peers))].Id())
-				if err := n.sendTo("advert", ControlChannel, peer, msg); err != nil {
-					log.Debugf("Network failed to advertise routes to %s: %v, sending multicast", err, peer.Id())
-					// send a multicast message if we fail to send Unicast message
-					if err := n.sendMsg("advert", ControlChannel, msg); err != nil {
-						log.Debugf("Network failed to advertise routes: %v", err)
+				if peer := n.node.GetPeerNode(peers[rnd.Intn(len(peers))].Id()); peer != nil {
+					if err := n.sendTo("advert", ControlChannel, peer, msg); err != nil {
+						log.Debugf("Network failed to advertise routes to %s: %v, sending multicast", err, peer.Id())
+						// send a multicast message if we fail to send Unicast message
+						if err := n.sendMsg("advert", ControlChannel, msg); err != nil {
+							log.Debugf("Network failed to advertise routes: %v", err)
+						}
 					}
 				}
 			}
@@ -794,10 +795,10 @@ func (n *network) processNetChan(listener tunnel.Listener) {
 					}
 				}
 
-				// we send the sync message because someone has sent connect
+				// we send the sync message because someone has sent connect message
 				// and wants to either connect or reconnect to the network
 				// The faster it gets the network config (routes and peer graph)
-				// the faster the network converges to a stable state
+				// the faster the network converges to stable state
 
 				go func() {
 					// get node peer graph to send back to the connecting node
@@ -827,27 +828,6 @@ func (n *network) processNetChan(listener tunnel.Listener) {
 					// send sync message to the newly connected peer
 					if err := n.sendTo("sync", NetworkChannel, peer, msg); err != nil {
 						log.Debugf("Network failed to send sync message: %v", err)
-					}
-					// wait for a short period of time before sending a solicit message
-					<-time.After(time.Millisecond * 100)
-
-					// send a solicit message when discovering new peer
-					// this triggers the node to flush its routing table to the network
-					// and leads to faster convergence of the network
-					solicit := &pbRtr.Solicit{
-						Id: n.options.Id,
-					}
-
-					// ask for the new nodes routes
-					if err := n.sendTo("solicit", ControlChannel, peer, solicit); err != nil {
-						log.Debugf("Network failed to send solicit message: %s", err)
-					}
-
-					// now advertise our own routes
-					select {
-					case n.solicited <- peer:
-					default:
-						// don't block
 					}
 				}()
 			case "peer":
@@ -964,7 +944,11 @@ func (n *network) processNetChan(listener tunnel.Listener) {
 					continue
 				}
 
-				log.Debugf("Network received sync message from: %s", pbNetSync.Peer.Node.Id)
+				logMsg := "Network received sync message from: %s"
+				if pbNetSync.Ack {
+					logMsg = "Network received sync ack message from: %s"
+				}
+				log.Debugf(logMsg, pbNetSync.Peer.Node.Id)
 
 				peer := &node{
 					id:       pbNetSync.Peer.Node.Id,
@@ -992,32 +976,70 @@ func (n *network) processNetChan(listener tunnel.Listener) {
 				}
 
 				// when we receive a sync message we update our routing table
-				// and send a peer message back to the network to announce our presence
-				// we consequently flush our table to the network too to make the convergence faster
+				// and send a Sync ACK message back to the network to send our routes with the peer
 
-				go func() {
-					// add all the routes we have received in the sync message
-					for _, pbRoute := range pbNetSync.Routes {
-						route := pbUtil.ProtoToRoute(pbRoute)
-						if err := n.router.Table().Create(route); err != nil && err != router.ErrDuplicateRoute {
-							log.Debugf("Network node %s failed to add route: %v", n.id, err)
+				if !pbNetSync.Ack {
+					// get node peer graph to send back to the connecting node
+					node := PeersToProto(n.node, MaxDepth)
+
+					msg := &pbNet.Sync{
+						Ack:  true,
+						Peer: node,
+					}
+
+					// get a list of all of our routes
+					// NOTE: we need to make sure we list our routes we want to send in Sync ACK
+					// before applying the ones we have just received in the Sync message
+					routes, err := n.options.Router.Table().List()
+					switch err {
+					case nil:
+						// encode the routes to protobuf
+						pbRoutes := make([]*pbRtr.Route, 0, len(routes))
+						for _, route := range routes {
+							pbRoute := pbUtil.RouteToProto(route)
+							pbRoutes = append(pbRoutes, pbRoute)
 						}
+						// pack the routes into the sync message
+						msg.Routes = pbRoutes
+					default:
+						// we can't list the routes
+						log.Debugf("Network node %s failed listing routes: %v", n.id, err)
 					}
 
-					// update your sync timestamp
-					// NOTE: this might go away as we will be doing full table advert to random peer
-					if err := n.RefreshSync(now); err != nil {
-						log.Debugf("Network failed refreshing sync time: %v", err)
-					}
+					// send Sync ACK back
+					go func() {
+						// send sync message to the newly connected peer
+						if err := n.sendTo("sync", NetworkChannel, peer, msg); err != nil {
+							log.Debugf("Network failed to send sync ACK message: %v", err)
+						}
+					}()
+				}
 
-					// get node peer graph to send back to the syncing node
-					msg := PeersToProto(n.node, MaxDepth)
-
-					// advertise yourself to the new node
-					if err := n.sendTo("peer", NetworkChannel, peer, msg); err != nil {
-						log.Debugf("Network failed to advertise peers: %v", err)
+				// add all the routes we have received in the sync message
+				for _, pbRoute := range pbNetSync.Routes {
+					route := pbUtil.ProtoToRoute(pbRoute)
+					if err := n.router.Table().Create(route); err != nil && err != router.ErrDuplicateRoute {
+						log.Debugf("Network node %s failed to add route: %v", n.id, err)
 					}
-				}()
+				}
+
+				// update your sync timestamp
+				// NOTE: this might go away as we will be doing full table advert to random peer
+				if err := n.RefreshSync(now); err != nil {
+					log.Debugf("Network failed refreshing sync time: %v", err)
+				}
+
+				// if we just processed Sync ACK message we reply with a peer message
+				if pbNetSync.Ack {
+					go func() {
+						msg := PeersToProto(n.node, MaxDepth)
+
+						// advertise yourself to the peer
+						if err := n.sendTo("peer", NetworkChannel, peer, msg); err != nil {
+							log.Debugf("Network failed to advertise peers: %v", err)
+						}
+					}()
+				}
 			case "close":
 				pbNetClose := &pbNet.Close{}
 				if err := proto.Unmarshal(m.msg.Body, pbNetClose); err != nil {
@@ -1100,12 +1122,15 @@ func (n *network) prunePeerRoutes(peer *node) error {
 // seen for a period of time. Also removes all the routes either originated by or routable
 // by the stale nodes. it also resolves nodes periodically and adds them to the tunnel
 func (n *network) manage() {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 	announce := time.NewTicker(AnnounceTime)
 	defer announce.Stop()
 	prune := time.NewTicker(PruneTime)
 	defer prune.Stop()
 	resolve := time.NewTicker(ResolveTime)
 	defer resolve.Stop()
+	netsync := time.NewTicker(SyncTime)
+	defer netsync.Stop()
 
 	// list of links we've sent to
 	links := make(map[string]time.Time)
@@ -1204,7 +1229,7 @@ func (n *network) manage() {
 
 				// unknown link and peer so lets do the connect flow
 				if err := n.sendTo("connect", NetworkChannel, peer, msg); err != nil {
-					log.Debugf("Network failed to advertise peer %s: %v", peer.id, err)
+					log.Debugf("Network failed to connect to peer %s: %v", peer.id, err)
 					continue
 				}
 
@@ -1252,6 +1277,42 @@ func (n *network) manage() {
 				if err := n.pruneRoutes(router.QueryRouter(route.Router)); err != nil {
 					log.Debugf("Network failed deleting routes by %s: %v", route.Router, err)
 				}
+			}
+		case <-netsync.C:
+			// get a list of node peers
+			peers := n.Peers()
+			// pick a random peer from the list of peers and request full sync
+			if peer := n.node.GetPeerNode(peers[rnd.Intn(len(peers))].Id()); peer != nil {
+				go func() {
+					// get node peer graph to send back to the connecting node
+					node := PeersToProto(n.node, MaxDepth)
+
+					msg := &pbNet.Sync{
+						Peer: node,
+					}
+
+					// get a list of all of our routes
+					routes, err := n.options.Router.Table().List()
+					switch err {
+					case nil:
+						// encode the routes to protobuf
+						pbRoutes := make([]*pbRtr.Route, 0, len(routes))
+						for _, route := range routes {
+							pbRoute := pbUtil.RouteToProto(route)
+							pbRoutes = append(pbRoutes, pbRoute)
+						}
+						// pack the routes into the sync message
+						msg.Routes = pbRoutes
+					default:
+						// we can't list the routes
+						log.Debugf("Network node %s failed listing routes: %v", n.id, err)
+					}
+
+					// send sync message to the newly connected peer
+					if err := n.sendTo("sync", NetworkChannel, peer, msg); err != nil {
+						log.Debugf("Network failed to send sync message: %v", err)
+					}
+				}()
 			}
 		case <-resolve.C:
 			n.initNodes(false)
